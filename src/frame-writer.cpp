@@ -630,7 +630,7 @@ void FrameWriter::init_audio_stream()
         audioCodecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     int err;
-    if ((err = avcodec_open2(audioCodecCtx, codec, NULL)) < 0)
+    if ((err = avcodec_open2(audioCodecCtx, codec, &options)) < 0)
     {
         std::cerr << "(audio) avcodec_open2 failed " << err << std::endl;
         std::exit(-1);
