@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <unistd.h>
+#include <poll.h>
+#include <errno.h>
 #include <gbm.h>
 #include <fcntl.h>
 #include <xf86drm.h>
@@ -242,20 +244,9 @@ wl_display *display = NULL;
 std::thread writer_thread;
 void handle_graceful_termination(int)
 {
+    /* Flags only — Wayland teardown from a signal handler races dispatch. */
     exit_main_loop = true;
     buffer_copy_done = true;
-    if (writer_thread.joinable())
-    {
-        writer_thread.join();
-    }
-    for (size_t i = 0; i < buffers.size(); i++)
-    {
-        auto buffer = buffers.at(i);
-        if (buffer && buffer->wl_buffer)
-            wl_buffer_destroy(buffer->wl_buffer);
-    }
-
-    wl_display_disconnect(display);
 }
 
 static struct wl_buffer *create_shm_buffer(uint32_t fmt,
@@ -951,6 +942,53 @@ static void sync_wayland()
     wl_display_roundtrip(display);
 }
 
+/* Dispatch with a timeout so exit_main_loop is observed while waiting for the
+ * next frame (damage-aware capture may block indefinitely). Uses poll +
+ * prepare_read so we do not require wl_display_dispatch_timeout (Wayland 1.25+);
+ * meson still depends on wayland-client >= 1.20.
+ *
+ * Returns the number of events dispatched (>= 0), or -1 on hard error.
+ * EINTR from poll is treated as a timeout (0) so the caller can re-check flags.
+ */
+static int dispatch_wayland_timeout_ms(int timeout_ms)
+{
+    while (wl_display_prepare_read(display) != 0)
+    {
+        if (wl_display_dispatch_pending(display) < 0)
+            return -1;
+    }
+
+    if (wl_display_flush(display) < 0)
+    {
+        wl_display_cancel_read(display);
+        return -1;
+    }
+
+    struct pollfd pfd;
+    pfd.fd = wl_display_get_fd(display);
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0)
+    {
+        wl_display_cancel_read(display);
+        if (errno == EINTR)
+            return 0;
+        return -1;
+    }
+
+    if (ret > 0)
+    {
+        if (wl_display_read_events(display) < 0)
+            return -1;
+    }
+    else
+    {
+        wl_display_cancel_read(display);
+    }
+
+    return wl_display_dispatch_pending(display);
+}
+
 static void load_output_info()
 {
     for (auto& wo : available_outputs)
@@ -1284,7 +1322,7 @@ void request_next_frame(bool reallocate)
     } else if (use_dmabuf && dirty)
     {
         frame_handle_linux_dmabuf(buffer.width, buffer.height, current_buffer_format, dirty);
-        while (!buffer.wl_buffer && !exit_main_loop && wl_display_dispatch(display) != -1);
+        while (!buffer.wl_buffer && !exit_main_loop && dispatch_wayland_timeout_ms(100) != -1);
     }
 
 
@@ -1752,14 +1790,20 @@ int main(int argc, char *argv[])
         buffer_copy_done = false;
         request_next_frame(false);
 
-        while (!buffer_copy_done && !exit_main_loop && wl_display_dispatch(display) != -1)
+        while (!buffer_copy_done && !exit_main_loop && dispatch_wayland_timeout_ms(100) != -1)
         {
-            std::this_thread::sleep_for(std::chrono::microseconds(idle_time * 25));
+            // timeout wakeups re-check exit_main_loop / buffer_copy_done
         }
 
         if (exit_main_loop)
         {
             break;
+        }
+
+        /* Wayland error or unexpected wake without a completed frame — retry. */
+        if (!buffer_copy_done)
+        {
+            continue;
         }
 
         auto& buffer = buffers.capture();
@@ -1775,6 +1819,36 @@ int main(int argc, char *argv[])
         }
 
         buffers.next_capture();
+    }
+
+    if (writer_thread.joinable())
+    {
+        writer_thread.join();
+    }
+
+    if (frame != NULL)
+    {
+        ext_image_copy_capture_frame_v1_destroy(frame);
+        frame = NULL;
+    }
+
+    if (recording_session != NULL)
+    {
+        ext_image_copy_capture_session_v1_destroy(recording_session);
+        recording_session = NULL;
+    }
+
+    if (copy_capture_source != NULL)
+    {
+        ext_image_capture_source_v1_destroy(copy_capture_source);
+        copy_capture_source = NULL;
+    }
+
+    for (size_t i = 0; i < buffers.size(); ++i)
+    {
+        auto buffer = buffers.at(i);
+        if (buffer && buffer->wl_buffer)
+            wl_buffer_destroy(buffer->wl_buffer);
     }
 
     if (gbm_device) {
