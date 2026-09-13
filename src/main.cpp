@@ -727,13 +727,12 @@ static void write_loop(FrameWriterParams params)
 
     while(!exit_main_loop)
     {
-        uint64_t elapsed = get_current_msec() - encode_last_time;
-        uint64_t ms = 1000 / framerate;
-
-        // wait for frame to become available
-        while ((buffers.encode().ready_encode() != true || elapsed < ms) && !exit_main_loop)
+        /* Encode as soon as a captured frame is queued. Do NOT also pace at
+         * 1/framerate here — request_next_frame() already rate-limits capture.
+         * Double pacing lets capture run ahead of encode and fills the buffer
+         * pool (immediate backlog / lag on fast ICC paths). */
+        while (buffers.encode().ready_encode() != true && !exit_main_loop)
         {
-            elapsed = get_current_msec() - encode_last_time;
             std::this_thread::sleep_for(std::chrono::microseconds(idle_time));
         }
         encode_last_time = get_current_msec();
