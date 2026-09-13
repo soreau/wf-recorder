@@ -9,8 +9,12 @@
 #include <thread>
 #include <type_traits>
 
-#define MAX_FRAME_FAILURES 64
+/* Live capture (Miracast) must not queue tens of frames — that is seconds of
+ * lag. Cap the pool and drop queued frames when the encoder falls behind. */
+#define MAX_BUFFERS 8
 #define INITIAL_BUFFERS_SIZE 2
+/* Keep old name as alias for any external references. */
+#define MAX_FRAME_FAILURES MAX_BUFFERS
 
 class buffer_pool_buf
 {
@@ -75,32 +79,54 @@ public:
     // from the compositor and select the next buffer to capture in.
     T& next_capture()
     {
-        bool warned = false;
+        bool warned_drop = false;
+        bool warned_wait = false;
         while (true)
         {
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                int next = (capture_idx + 1) % bufs_size;
+                int next = (capture_idx + 1) % static_cast<int>(bufs_size);
                 if (!bufs[next]->ready_capture())
                 {
-                    if (bufs_size < MAX_FRAME_FAILURES)
+                    if (bufs_size < MAX_BUFFERS)
                     {
                         bufs_size++;
                         std::cerr << "bufs_size: " << bufs_size << std::endl;
                         bufs[bufs_size - 1] = new T;
-                        next = (capture_idx + 1) % bufs_size;
+                        next = (capture_idx + 1) % static_cast<int>(bufs_size);
                     }
                     else
                     {
-                        /* Encoder behind: apply backpressure instead of aborting
-                         * (exit killed Miracast until FluxCast restarted). */
-                        if (!warned)
+                        /* Drop oldest *queued* encode frames (available, not yet
+                         * taken by the writer) to keep live latency low. */
+                        int guard = static_cast<int>(bufs_size);
+                        while (!bufs[next]->ready_capture() && guard-- > 0)
                         {
-                            std::cerr << "buffer pool full (" << bufs_size
-                                      << "); waiting for encoder" << std::endl;
-                            warned = true;
+                            if (encode_idx == capture_idx)
+                                break;
+                            if (!bufs[encode_idx]->ready_encode())
+                                break; // writer owns this slot
+                            if (!warned_drop)
+                            {
+                                std::cerr << "buffer pool full; dropping queued frames"
+                                          << std::endl;
+                                warned_drop = true;
+                            }
+                            bufs[encode_idx]->available = false;
+                            bufs[encode_idx]->released = true;
+                            encode_idx = (encode_idx + 1) % static_cast<int>(bufs_size);
+                            next = (capture_idx + 1) % static_cast<int>(bufs_size);
                         }
-                        next = -1; // signal wait below
+                        if (!bufs[next]->ready_capture())
+                        {
+                            if (!warned_wait)
+                            {
+                                std::cerr << "buffer pool full; brief wait for encoder"
+                                          << std::endl;
+                                warned_wait = true;
+                            }
+                            next = -1;
+                        }
                     }
                 }
                 if (next >= 0)
@@ -113,7 +139,7 @@ public:
                     return *bufs[capture_idx];
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
 
@@ -124,13 +150,13 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         bufs[encode_idx]->available = false;
         bufs[encode_idx]->released = true;
-        encode_idx = (encode_idx + 1) % bufs_size;
+        encode_idx = (encode_idx + 1) % static_cast<int>(bufs_size);
         return *bufs[encode_idx];
     }
 
 private:
     std::mutex mutex;
-    std::array<T*, MAX_FRAME_FAILURES> bufs;
+    std::array<T*, MAX_BUFFERS> bufs;
     size_t bufs_size = INITIAL_BUFFERS_SIZE;
     int capture_idx = 0; // head
     int encode_idx = 0; // tail
