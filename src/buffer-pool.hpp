@@ -6,7 +6,9 @@
 #include <functional>
 #include <type_traits>
 
-#define MAX_FRAME_FAILURES 64
+/* Keep small: each queued buffer is a frame of end-to-end lag. Grow a little
+ * for burstiness, then drop captures — never sleep, never abort. */
+#define MAX_FRAME_FAILURES 6
 #define INITIAL_BUFFERS_SIZE 2
 
 class buffer_pool_buf
