@@ -3,7 +3,10 @@
 #include <array>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <functional>
+#include <iostream>
+#include <thread>
 #include <type_traits>
 
 #define MAX_FRAME_FAILURES 64
@@ -72,26 +75,46 @@ public:
     // from the compositor and select the next buffer to capture in.
     T& next_capture()
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        int next = (capture_idx + 1) % bufs_size;
-        if (!bufs[next]->ready_capture())
+        bool warned = false;
+        while (true)
         {
-            bufs_size++;
-            if (bufs_size > MAX_FRAME_FAILURES)
             {
-                std::cerr << "Too many buffers! (" << bufs_size << " > " << MAX_FRAME_FAILURES << ")" << std::endl;
-                exit(EXIT_FAILURE);
+                std::lock_guard<std::mutex> lock(mutex);
+                int next = (capture_idx + 1) % bufs_size;
+                if (!bufs[next]->ready_capture())
+                {
+                    if (bufs_size < MAX_FRAME_FAILURES)
+                    {
+                        bufs_size++;
+                        std::cerr << "bufs_size: " << bufs_size << std::endl;
+                        bufs[bufs_size - 1] = new T;
+                        next = (capture_idx + 1) % bufs_size;
+                    }
+                    else
+                    {
+                        /* Encoder behind: apply backpressure instead of aborting
+                         * (exit killed Miracast until FluxCast restarted). */
+                        if (!warned)
+                        {
+                            std::cerr << "buffer pool full (" << bufs_size
+                                      << "); waiting for encoder" << std::endl;
+                            warned = true;
+                        }
+                        next = -1; // signal wait below
+                    }
+                }
+                if (next >= 0)
+                {
+                    bufs[capture_idx]->released = false;
+                    bufs[capture_idx]->available = true;
+                    capture_idx = next;
+                    bufs[capture_idx]->released = true;
+                    bufs[capture_idx]->available = false;
+                    return *bufs[capture_idx];
+                }
             }
-            std::cerr << "bufs_size: " << bufs_size << std::endl;
-            bufs[bufs_size - 1] = new T;
-            next = (capture_idx + 1) % bufs_size;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        bufs[capture_idx]->released = false;
-        bufs[capture_idx]->available = true;
-        capture_idx = next;
-        bufs[capture_idx]->released = true;
-        bufs[capture_idx]->available = false;
-        return *bufs[capture_idx];
     }
 
     // Signal that the encode buffer has been submitted for encoding
